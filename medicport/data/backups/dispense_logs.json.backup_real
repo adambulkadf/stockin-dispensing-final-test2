@@ -1,0 +1,99 @@
+{
+  "products": {
+    "1": {
+      "barcode": "05099151006615",
+      "total_dispensed": 11,
+      "last_dispensed": "2025-11-16T17:19:03.847608",
+      "daily_dispenses": {
+        "2025-11-14": 9,
+        "2025-11-16": 2
+      },
+      "weekly_dispenses": {
+        "2025-W46": 11
+      },
+      "monthly_dispenses": {
+        "2025-11": 11
+      }
+    },
+    "2": {
+      "barcode": "08588007409306",
+      "total_dispensed": 3,
+      "last_dispensed": "2025-11-14T14:01:17.839462",
+      "daily_dispenses": {
+        "2025-11-14": 3
+      },
+      "weekly_dispenses": {
+        "2025-W46": 3
+      },
+      "monthly_dispenses": {
+        "2025-11": 3
+      }
+    },
+    "3": {
+      "barcode": "03838989638689",
+      "total_dispensed": 2,
+      "last_dispensed": "2025-11-14T14:01:17.473831",
+      "daily_dispenses": {
+        "2025-11-14": 2
+      },
+      "weekly_dispenses": {
+        "2025-W46": 2
+      },
+      "monthly_dispenses": {
+        "2025-11": 2
+      }
+    },
+    "9": {
+      "barcode": "5997321782447",
+      "total_dispensed": 2,
+      "last_dispensed": "2025-11-14T20:24:14.539657",
+      "daily_dispenses": {
+        "2025-11-14": 2
+      },
+      "weekly_dispenses": {
+        "2025-W46": 2
+      },
+      "monthly_dispenses": {
+        "2025-11": 2
+      }
+    },
+    "4": {
+      "barcode": "05099151006615",
+      "total_dispensed": 2,
+      "last_dispensed": "2025-11-14T20:36:50.225872",
+      "daily_dispenses": {
+        "2025-11-14": 2
+      },
+      "weekly_dispenses": {
+        "2025-W46": 2
+      },
+      "monthly_dispenses": {
+        "2025-11": 2
+      }
+    },
+    "20": {
+      "barcode": "5060163211021",
+      "total_dispensed": 3,
+      "last_dispensed": "2025-11-14T20:56:24.830149",
+      "daily_dispenses": {
+        "2025-11-14": 3
+      },
+      "weekly_dispenses": {
+        "2025-W46": 3
+      },
+      "monthly_dispenses": {
+        "2025-11": 3
+      }
+    }
+  },
+  "summary": {
+    "total_dispenses": 23,
+    "last_updated": "2025-11-16T17:19:03.847608",
+    "current_week": "2025-W46",
+    "current_month": "2025-11"
+  },
+  "archive": {
+    "weeks": {},
+    "months": {}
+  }
+}
