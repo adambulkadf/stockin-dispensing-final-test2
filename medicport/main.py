@@ -222,6 +222,7 @@ shelves: Dict[int, Shelf] = {}
 virtual_units: Dict[int, VirtualStorageUnit] = {}
 items: Dict[int, Item] = {}
 tasks: Dict[str, Task] = {}
+pending_placements: Dict[str, dict] = {}  # {task_id: {vsu_id, stock_index, item_depth}}
 task_counter = 0
 item_counter = 0
 vsu_counter = 28  # Start after existing VSUs
@@ -430,12 +431,25 @@ def can_stack_in_vsu(item: Item, vsu: VirtualStorageUnit) -> bool:
     # Check if depth fits in VSU (including 3mm gap between items)
     num_existing_items = len(vsu.items)
     total_depth_used = first_item.metadata.dimensions.depth * num_existing_items  # All same depth
-    total_depth_with_gaps = total_depth_used + (num_existing_items * DEPTH_GAP_BETWEEN_ITEMS)
+
+    # Account for pending placements in this VSU
+    pending_for_vsu = [p for p in pending_placements.values() if p["vsu_id"] == vsu.id]
+    pending_depth = sum(p["item_depth"] + DEPTH_GAP_BETWEEN_ITEMS for p in pending_for_vsu)
+
+    total_depth_with_gaps = total_depth_used + (num_existing_items * DEPTH_GAP_BETWEEN_ITEMS) + pending_depth
 
     remaining_depth = vsu.dimensions.depth - total_depth_with_gaps
 
     if item.metadata.dimensions.depth > remaining_depth:
-        print(f"      VSU {vsu.code}: Not enough depth (need {item.metadata.dimensions.depth}mm, only {remaining_depth}mm available after gaps)")
+        print(f"      VSU {vsu.code}: Not enough depth (need {item.metadata.dimensions.depth}mm, only {remaining_depth}mm available, pending: {len(pending_for_vsu)})")
+        return False
+
+    # Check if there's a valid stock index available
+    max_items = calculate_max_items_in_vsu(vsu, item.metadata.dimensions.depth)
+    pending_count = len(pending_for_vsu)
+    calculated_index = max_items - num_existing_items - pending_count - 1
+    if calculated_index < 0:
+        print(f"      VSU {vsu.code}: VSU full (max {max_items}, existing {num_existing_items}, pending {pending_count})")
         return False
 
     print(f"      VSU {vsu.code}: CAN STACK! (depth {remaining_depth}mm available, placing in front)")
@@ -464,57 +478,129 @@ def calculate_stock_index(vsu: VirtualStorageUnit, item_depth: float, is_new_vsu
     Next item placed in front gets (max_capacity - 2), and so on.
     Last item at front gets index 0.
 
-    For stacking (existing VSU): index = max_capacity - current_count - 1
-    For new VSU: index = max_capacity - 1 (first item at back)
+    For stacking (existing VSU): index = max_capacity - current_count - pending_count - 1
+    For new VSU: index = max_capacity - 1 - pending_count (account for pending)
+
+    Returns -1 if VSU is full (no valid index available)
     """
     max_items = calculate_max_items_in_vsu(vsu, item_depth)
     current_count = len(vsu.items)
 
+    # Count pending placements for this VSU
+    pending_count = sum(1 for p in pending_placements.values() if p["vsu_id"] == vsu.id)
+
     if is_new_vsu or current_count == 0:
-        # First item in VSU - place at back with highest index
-        return max_items - 1
+        # First item in VSU - place at back with highest index (minus any pending)
+        index = max_items - 1 - pending_count
     else:
-        # Stacking - place in front of existing items
-        return max_items - current_count - 1
+        # Stacking - place in front of existing items and pending items
+        index = max_items - current_count - pending_count - 1
+
+    # Return -1 if VSU is full
+    return index if index >= 0 else -1
 
 
 def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_index: int) -> float:
     """
     Calculate Z coordinate for item based on stock index.
 
-    Stock index 0 = front of VSU (lowest Z)
-    Higher stock index = further back (higher Z)
+    Boxes are placed from the back wall forward:
+    - First box (highest stock_index) touches the back wall
+    - Each subsequent box is placed 3mm in front of the previous
+    - Empty space is at the front of the VSU
 
-    Z = vsu.position.z + (stock_index * (item_depth + gap))
+    Since highest stock_index is at the back:
+    - stock_index = max-1 → offset = 0 → box back at back_wall
+    - stock_index = 0 → offset = (max-1) * effective_depth → box at front
     """
+    max_items = calculate_max_items_in_vsu(vsu, item_depth)
+    back_wall_z = vsu.position.z + vsu.dimensions.depth
     effective_item_depth = item_depth + DEPTH_GAP_BETWEEN_ITEMS
-    z_offset = stock_index * effective_item_depth
-    return vsu.position.z + z_offset
+
+    # How many positions is this box from the back?
+    positions_from_back = max_items - 1 - stock_index
+    z_offset = positions_from_back * effective_item_depth
+
+    # Z position is measured from back wall toward front
+    # box_back = back_wall_z - offset, so box_front = back_wall_z - offset - item_depth
+    return back_wall_z - item_depth - z_offset
 
 
 def find_vsu_for_stacking(item: Item) -> Optional[VirtualStorageUnit]:
-    """Find existing VSU where item can stack"""
+    """Find existing VSU where item can stack (including pending placements)"""
     product_id = item.metadata.product_id
-    
-    # Debug: Find all VSUs with same product
+
+    # Debug: Find all VSUs with same product (actual items)
     matching_product_vsus = []
     for vsu in virtual_units.values():
         if vsu.items:
             first_item = items[vsu.items[0]]
             if first_item.metadata.product_id == product_id:
                 matching_product_vsus.append(vsu)
-    
+
+    # Also check pending placements for same product
+    pending_same_product = [p for p in pending_placements.values() if p["product_id"] == product_id]
+
     print(f"Looking for stacking VSU for Product {product_id}")
-    print(f"   Found {len(matching_product_vsus)} VSUs with same product")
-    
-    # Check each matching VSU
+    print(f"   Found {len(matching_product_vsus)} VSUs with same product (actual)")
+    print(f"   Found {len(pending_same_product)} pending placements with same product")
+
+    # Check each matching VSU (actual items)
     for vsu in virtual_units.values():
         if can_stack_in_vsu(item, vsu):
             print(f"   STACKING in VSU {vsu.code} (has {len(vsu.items)} items)")
             return vsu
-    
+
+    # Check pending placements - find VSU where same product is pending
+    for pending in pending_same_product:
+        vsu = virtual_units.get(pending["vsu_id"])
+        if vsu and can_stack_with_pending(item, vsu, pending):
+            print(f"   STACKING in VSU {vsu.code} (has pending placement for same product)")
+            return vsu
+
     print(f"   No suitable VSU found - will create new")
     return None
+
+
+def can_stack_with_pending(item: Item, vsu: VirtualStorageUnit, pending: dict) -> bool:
+    """Check if item can stack in VSU that has pending placement (may or may not have actual items)"""
+    # Check dimensions match (same rules as can_stack_in_vsu)
+    width_diff = abs(item.metadata.dimensions.width - pending["item_width"])
+    if width_diff > WIDTH_TOLERANCE:
+        return False
+
+    height_diff = abs(item.metadata.dimensions.height - pending["item_height"])
+    if height_diff > HEIGHT_TOLERANCE:
+        return False
+
+    # Depth must match exactly
+    if item.metadata.dimensions.depth != pending["item_depth"]:
+        return False
+
+    # Check remaining depth (accounting for actual items AND all pending items)
+    num_existing_items = len(vsu.items)
+    existing_depth = 0
+    if num_existing_items > 0:
+        first_item = items[vsu.items[0]]
+        existing_depth = first_item.metadata.dimensions.depth * num_existing_items + (num_existing_items * DEPTH_GAP_BETWEEN_ITEMS)
+
+    pending_for_vsu = [p for p in pending_placements.values() if p["vsu_id"] == vsu.id]
+    pending_depth = sum(p["item_depth"] + DEPTH_GAP_BETWEEN_ITEMS for p in pending_for_vsu)
+
+    total_used = existing_depth + pending_depth
+    remaining_depth = vsu.dimensions.depth - total_used
+
+    if item.metadata.dimensions.depth > remaining_depth:
+        return False
+
+    # Check if there's a valid stock index available
+    max_items = calculate_max_items_in_vsu(vsu, item.metadata.dimensions.depth)
+    pending_count = len(pending_for_vsu)
+    calculated_index = max_items - num_existing_items - pending_count - 1
+    if calculated_index < 0:
+        return False
+
+    return True
 
 def find_empty_vsu_for_item(item: Item) -> Optional[VirtualStorageUnit]:
     """
@@ -530,6 +616,10 @@ def find_empty_vsu_for_item(item: Item) -> Optional[VirtualStorageUnit]:
     for vsu in virtual_units.values():
         # Must be empty
         if vsu.items:
+            continue
+
+        # Skip if there are pending placements for this VSU
+        if any(p["vsu_id"] == vsu.id for p in pending_placements.values()):
             continue
 
         # Check if item fits in VSU dimensions
@@ -628,12 +718,17 @@ def find_mixed_product_vsu(item: Item) -> Optional[VirtualStorageUnit]:
         # Check remaining depth (including 3mm gap for new item)
         num_existing_items = len(vsu.items)
         total_depth_used = sum(items[i].metadata.dimensions.depth for i in vsu.items)
-        # Include gaps between existing items + gap for new item
-        total_depth_with_gaps = total_depth_used + (num_existing_items * DEPTH_GAP_BETWEEN_ITEMS)
+
+        # Account for pending placements in this VSU
+        pending_for_vsu = [p for p in pending_placements.values() if p["vsu_id"] == vsu.id]
+        pending_depth = sum(p["item_depth"] + DEPTH_GAP_BETWEEN_ITEMS for p in pending_for_vsu)
+
+        # Include gaps between existing items + gap for new item + pending items
+        total_depth_with_gaps = total_depth_used + (num_existing_items * DEPTH_GAP_BETWEEN_ITEMS) + pending_depth
         remaining_depth = vsu.dimensions.depth - total_depth_with_gaps
 
         if item_depth > remaining_depth:
-            print(f"      VSU {vsu.code}: Need {item_depth}mm, only {remaining_depth}mm available")
+            print(f"      VSU {vsu.code}: Need {item_depth}mm, only {remaining_depth}mm available (pending: {len(pending_for_vsu)})")
             continue
 
         # Calculate wasted space (lower = tighter fit = better)
@@ -1337,6 +1432,16 @@ async def suggest_placement(scanner_input: ScannerInput):
         )
         tasks[task_id] = task
 
+        # Reserve this placement (prevents duplicate suggestions)
+        pending_placements[task_id] = {
+            "vsu_id": target_vsu.id,
+            "stock_index": stock_index,
+            "item_depth": item.metadata.dimensions.depth,
+            "item_width": item.metadata.dimensions.width,
+            "item_height": item.metadata.dimensions.height,
+            "product_id": item.metadata.product_id
+        }
+
         # Update progress (pending)
         progress["total_boxes"] += 1
 
@@ -1390,6 +1495,10 @@ async def complete_task(task_id: str):
     try:
         # Update task status
         task.status = "completed"
+
+        # Remove from pending placements (reservation complete)
+        if task_id in pending_placements:
+            del pending_placements[task_id]
 
         # Get item and VSU
         item = items[task.item_id]
@@ -1456,7 +1565,11 @@ async def fail_task(task_id: str, reason: Optional[str] = "Unknown error"):
     try:
         # Update task status
         task.status = "failed"
-        
+
+        # Release pending placement reservation
+        if task_id in pending_placements:
+            del pending_placements[task_id]
+
         # FREE THE ROBOT - Return to input position and set IDLE
         robot = robots.get(task.robot_id)
         if robot:
