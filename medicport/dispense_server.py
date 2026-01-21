@@ -100,12 +100,25 @@ async def complete_dispense(request: CompleteDispenseRequest):
 @dispense_app.post("/dispense/fail", tags=["Dispensing Operations"])
 async def fail_dispense(request: FailDispenseRequest):
     """
-    Mark a dispense task as failed - no inventory changes
+    Mark a dispense task as failed with optional partial success.
+
+    If successful_trips is provided, those items will be removed from inventory.
+    Items from trips NOT in successful_trips remain in inventory.
+
+    Example:
+        {
+            "task_id": "DISP_001",
+            "successful_trips": [1, 2, 3]  // Trips 1-3 dispensed successfully
+        }
     """
     return fail_dispense_endpoint(
         request,
+        items,
         robots,
-        save_robots_to_file
+        virtual_units,
+        shelves,
+        save_robots_to_file,
+        save_warehouse_state
     )
 
 
