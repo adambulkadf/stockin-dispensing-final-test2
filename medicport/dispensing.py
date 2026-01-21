@@ -100,9 +100,10 @@ class CompleteDispenseRequest(BaseModel):
     task_id: str
 
 class FailDispenseRequest(BaseModel):
-    """Request to mark dispensing as failed"""
+    """Request to mark dispensing as failed (with optional partial success)"""
     task_id: str
-    reason: str
+    reason: str = "partial_failure"
+    successful_trips: List[int] = []  # Trip numbers that were successfully dispensed
 
 dispense_tasks: Dict[str, DispenseTask] = {}
 dispense_task_counter = 0
@@ -1719,57 +1720,219 @@ def complete_dispense_endpoint(
 
 def fail_dispense_endpoint(
     request: FailDispenseRequest,
+    items: Dict[int, 'Item'],
     robots: Dict[str, 'Robot'],
-    save_robots_func
+    virtual_units: Dict[int, 'VirtualStorageUnit'],
+    shelves: Dict[int, 'StorageUnit'],
+    save_robots_func,
+    save_warehouse_func=None
 ):
-    """Mark dispensing as failed - no inventory changes"""
+    """
+    Mark dispensing as failed with optional partial success.
+
+    If successful_trips is provided:
+    - Items from those trips are removed from inventory (they were dispensed)
+    - Items from trips NOT listed remain in inventory (they failed or weren't attempted)
+
+    If successful_trips is empty:
+    - No inventory changes (complete failure)
+    """
     try:
         task_id = request.task_id
 
         if task_id not in dispense_tasks:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-        
+
         task = dispense_tasks[task_id]
-        
+
         if task.status == "completed":
             raise HTTPException(status_code=400, detail=f"Task {task_id} already completed")
-        
+
         if task.status == "failed":
             raise HTTPException(status_code=400, detail=f"Task {task_id} already failed")
-        
+
+        successful_trips = request.successful_trips or []
+
         print(f"\n{'='*60}")
         print(f"FAILING DISPENSE TASK: {task_id}")
         print(f"Reason: {request.reason}")
+        print(f"Successful trips: {successful_trips if successful_trips else 'None (complete failure)'}")
         print(f"{'='*60}")
 
-        task.status = "failed"
+        items_removed = []
+        items_kept = []
+
+        if successful_trips:
+            from product_archive import archive_dispensed_item
+
+            for instruction in task.instructions:
+                trip_number = instruction.trip_number
+
+                for dispense_item in instruction.items:
+                    item_id = dispense_item.item_id
+                    action = getattr(dispense_item, 'action', 'pick')
+
+                    if action == 'relocate':
+                        continue
+
+                    if item_id not in items:
+                        print(f"  WARNING: Item {item_id} not found, skipping")
+                        continue
+
+                    item = items[item_id]
+                    barcode = item.metadata.barcode
+                    product_id = item.metadata.product_id
+
+                    if trip_number in successful_trips:
+                        vsu = None
+                        shelf_id = None
+                        shelf_name = "Unknown"
+
+                        if item.vsu_id and item.vsu_id in virtual_units:
+                            vsu = virtual_units[item.vsu_id]
+                            shelf_id = vsu.shelf_id
+
+                            if shelf_id and shelf_id in shelves:
+                                shelf = shelves[shelf_id]
+                                shelf_name = shelf.name
+
+                            archive_dispensed_item(
+                                item_id=item_id,
+                                item=item,
+                                vsu=vsu,
+                                shelf_id=shelf_id,
+                                shelf_name=shelf_name,
+                                task_id=task_id
+                            )
+
+                            if item_id in vsu.items:
+                                vsu.items.remove(item_id)
+                            if not vsu.items:
+                                vsu.occupied = False
+
+                        items_removed.append({
+                            "item_id": item_id,
+                            "product_id": product_id,
+                            "barcode": barcode,
+                            "trip_number": trip_number
+                        })
+                        del items[item_id]
+                        print(f"  Trip {trip_number}: REMOVED item {item_id} ({barcode})")
+                    else:
+                        items_kept.append({
+                            "item_id": item_id,
+                            "product_id": product_id,
+                            "barcode": barcode,
+                            "trip_number": trip_number
+                        })
+                        print(f"  Trip {trip_number}: KEPT item {item_id} ({barcode}) - not in successful_trips")
+
+            if save_warehouse_func:
+                save_warehouse_func()
+
+            task.status = "partial"
+        else:
+            task.status = "failed"
+
         task.failure_reason = request.reason
         task.completed_at = datetime.now()
 
         robots_freed = []
-        for instruction in task.instructions:
-            robot_id = instruction.robot_id
-            if robot_id in robots:
-                robots[robot_id].status = "IDLE"
-                robots[robot_id].current_task_id = None
-                robots_freed.append(robot_id)
+        robot_ids_in_task = list(set(inst.robot_id for inst in task.instructions))
+        total_robots = len(robot_ids_in_task)
 
-        print(f"Robots freed: {set(robots_freed)}")
+        if task.robot_output_positions:
+            output_to_robots = {}
+            for robot_id in robot_ids_in_task:
+                if robot_id in task.robot_output_positions:
+                    output_pos = task.robot_output_positions[robot_id]
+                    output_key = (output_pos['x'], output_pos['y'], output_pos['z'])
+                    if output_key not in output_to_robots:
+                        output_to_robots[output_key] = []
+                    output_to_robots[output_key].append(robot_id)
+
+            final_robot_positions = {}
+            for output_key, robots_at_output in output_to_robots.items():
+                base_output_dict = {"x": output_key[0], "y": output_key[1], "z": output_key[2]}
+
+                if len(robots_at_output) == 1:
+                    final_robot_positions[robots_at_output[0]] = base_output_dict
+                else:
+                    robot_index_map = {robot_id: idx for idx, robot_id in enumerate(sorted(robots_at_output))}
+                    for robot_id in robots_at_output:
+                        robot_index = robot_index_map[robot_id]
+                        offset_pos = calculate_robot_output_offset(
+                            robot_id,
+                            base_output_dict,
+                            robot_index,
+                            len(robots_at_output)
+                        )
+                        final_robot_positions[robot_id] = offset_pos
+
+            for robot_id, final_pos in final_robot_positions.items():
+                if robot_id in robots:
+                    robots[robot_id].status = "IDLE"
+                    robots[robot_id].current_task_id = None
+                    robots[robot_id].position.x = final_pos["x"]
+                    robots[robot_id].position.y = final_pos["y"]
+                    robots[robot_id].position.z = final_pos["z"]
+                    robots_freed.append(robot_id)
+
+            print(f"Robots freed at OUTPUTS (per-robot positions):")
+            for robot_id in sorted(final_robot_positions.keys()):
+                final_pos = final_robot_positions[robot_id]
+                print(f"  {robot_id} -> ({final_pos['x']}, {final_pos['y']}, {final_pos['z']})")
+
+        else:
+            base_output_pos = task.output_position
+
+            robot_index_map = {robot_id: idx for idx, robot_id in enumerate(sorted(robot_ids_in_task))}
+
+            robot_output_positions = {}
+            for robot_id in robot_ids_in_task:
+                robot_index = robot_index_map[robot_id]
+                offset_pos = calculate_robot_output_offset(
+                    robot_id,
+                    base_output_pos,
+                    robot_index,
+                    total_robots
+                )
+                robot_output_positions[robot_id] = offset_pos
+
+            for robot_id, offset_pos in robot_output_positions.items():
+                if robot_id in robots:
+                    robots[robot_id].status = "IDLE"
+                    robots[robot_id].current_task_id = None
+                    robots[robot_id].position.x = offset_pos["x"]
+                    robots[robot_id].position.y = offset_pos["y"]
+                    robots[robot_id].position.z = offset_pos["z"]
+                    robots_freed.append(robot_id)
+
+            print(f"Robots freed at OUTPUT positions:")
+            for robot_id, offset_pos in robot_output_positions.items():
+                print(f"  {robot_id} -> ({offset_pos['x']}, {offset_pos['y']}, {offset_pos['z']})")
+
         save_robots_func()
-        
-        print(f"Dispense task marked as failed")
-        print(f"  No inventory changes made")
+
+        print(f"\nSummary:")
+        print(f"  Items removed (successful trips): {len(items_removed)}")
+        print(f"  Items kept (failed/not attempted): {len(items_kept)}")
+        print(f"  Task status: {task.status}")
         print(f"{'='*60}\n")
-        
+
         return {
             "status": "success",
             "task_id": task_id,
-            "message": "Task marked as failed, no inventory changes",
+            "task_status": task.status,
+            "message": f"Task marked as {task.status}",
+            "successful_trips": successful_trips,
+            "items_removed": items_removed,
+            "items_kept": items_kept,
             "robots_freed": list(set(robots_freed)),
             "failure_reason": request.reason,
             "failed_at": task.completed_at.isoformat()
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
