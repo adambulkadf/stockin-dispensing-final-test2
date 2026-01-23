@@ -62,7 +62,7 @@ app.add_middleware(
 VSU_HORIZONTAL_GAP = 5  # 5mm gap between VSUs (X-axis)
 VSU_TOP_CLEARANCE = 3  # 3mm gap from item top to shelf
 WIDTH_TOLERANCE = 5  # ±5mm tolerance for width matching when stacking
-HEIGHT_TOLERANCE = 5  # ±5mm tolerance for height matching when stacking
+DEPTH_TOLERANCE = 5  # -5mm tolerance for depth (new item can be 0-5mm smaller, not larger)
 DEPTH_GAP_BETWEEN_ITEMS = 3  # 3mm gap between items in same VSU (depth)
 
 def safe_parse_datetime(dt_string: str) -> datetime:
@@ -156,6 +156,7 @@ class Task(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     is_new_vsu: bool = False
     z_position: float = 0
+    is_mixed_product: bool = False  # True when placing different product in existing VSU
 
 def load_robots_from_file():
     """Load robot data from robot_post.json"""
@@ -383,8 +384,8 @@ def can_stack_in_vsu(item: Item, vsu: VirtualStorageUnit) -> bool:
     Stacking rules:
     - Same product ID (same barcode)
     - Width within ±5mm tolerance
-    - Height within ±5mm tolerance
-    - Depth must be EXACTLY same
+    - Height: any height that fits in VSU (VSU was created for this product)
+    - Depth: new item can be 0-5mm SMALLER than existing (not larger)
     - New item width must be ≤ frontmost item width (can't put wider box in front)
     """
     if not vsu.items:
@@ -409,15 +410,19 @@ def can_stack_in_vsu(item: Item, vsu: VirtualStorageUnit) -> bool:
         print(f"      VSU {vsu.code}: Width mismatch ({width_diff}mm > {WIDTH_TOLERANCE}mm tolerance)")
         return False
 
-    # Check height matches (±5mm tolerance) for stacking compatibility
-    height_diff = abs(item.metadata.dimensions.height - first_item.metadata.dimensions.height)
-    if height_diff > HEIGHT_TOLERANCE:
-        print(f"      VSU {vsu.code}: Height mismatch ({height_diff}mm > {HEIGHT_TOLERANCE}mm tolerance)")
-        return False
+    # Height: No tolerance check needed - any height that fits in VSU is OK
+    # (VSU was created based on first item, so product variations should fit)
 
-    # Depth must be EXACTLY same for stacking
-    if item.metadata.dimensions.depth != first_item.metadata.dimensions.depth:
-        print(f"      VSU {vsu.code}: Depth mismatch ({item.metadata.dimensions.depth}mm != {first_item.metadata.dimensions.depth}mm) - must be exact")
+    # Depth: Allow new item to be 0-5mm SMALLER than first item (not larger)
+    # This handles slight product variations while ensuring no overflow
+    depth_diff = item.metadata.dimensions.depth - first_item.metadata.dimensions.depth
+    if depth_diff > 0:
+        # New item is LARGER - reject (would cause stock index issues)
+        print(f"      VSU {vsu.code}: New item depth ({item.metadata.dimensions.depth}mm) > existing ({first_item.metadata.dimensions.depth}mm) - can't stack larger")
+        return False
+    if abs(depth_diff) > DEPTH_TOLERANCE:
+        # New item is too much smaller (>5mm) - reject
+        print(f"      VSU {vsu.code}: Depth difference ({abs(depth_diff)}mm) > {DEPTH_TOLERANCE}mm tolerance")
         return False
 
     # CRITICAL: New item width must be ≤ frontmost item width
@@ -429,8 +434,9 @@ def can_stack_in_vsu(item: Item, vsu: VirtualStorageUnit) -> bool:
         return False
 
     # Check if depth fits in VSU (including 3mm gap between items)
+    # Use first_item depth for calculation (conservative estimate)
     num_existing_items = len(vsu.items)
-    total_depth_used = first_item.metadata.dimensions.depth * num_existing_items  # All same depth
+    total_depth_used = first_item.metadata.dimensions.depth * num_existing_items  # Use first item depth
 
     # Account for pending placements in this VSU
     pending_for_vsu = [p for p in pending_placements.values() if p["vsu_id"] == vsu.id]
@@ -470,7 +476,7 @@ def calculate_max_items_in_vsu(vsu: VirtualStorageUnit, item_depth: float) -> in
     return max(1, max_items)
 
 
-def calculate_stock_index(vsu: VirtualStorageUnit, item_depth: float, is_new_vsu: bool) -> int:
+def calculate_stock_index(vsu: VirtualStorageUnit, item_depth: float, is_new_vsu: bool, is_mixed_product: bool = False) -> int:
     """
     Calculate stock index for back-to-front placement.
 
@@ -478,11 +484,17 @@ def calculate_stock_index(vsu: VirtualStorageUnit, item_depth: float, is_new_vsu
     Next item placed in front gets (max_capacity - 2), and so on.
     Last item at front gets index 0.
 
-    For stacking (existing VSU): index = max_capacity - current_count - pending_count - 1
+    For SAME product stacking: index = max_capacity - current_count - pending_count - 1
     For new VSU: index = max_capacity - 1 - pending_count (account for pending)
+    For MIXED product: Always return 0 (new item goes to front, existing items will be shifted back)
 
     Returns -1 if VSU is full (no valid index available)
     """
+    # MIXED PRODUCT: New item always gets index 0 (placed at front)
+    # Existing items will be shifted back (+1 to their indices) when placement is completed
+    if is_mixed_product:
+        return 0
+
     max_items = calculate_max_items_in_vsu(vsu, item_depth)
     current_count = len(vsu.items)
 
@@ -500,7 +512,7 @@ def calculate_stock_index(vsu: VirtualStorageUnit, item_depth: float, is_new_vsu
     return index if index >= 0 else -1
 
 
-def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_index: int) -> float:
+def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_index: int, is_mixed_product: bool = False) -> float:
     """
     Calculate Z coordinate for item based on stock index.
 
@@ -518,73 +530,74 @@ def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_
     """
     back_wall_z = vsu.position.z + vsu.dimensions.depth
 
-    # Check if VSU has existing items with different depths (mixed product scenario)
-    if vsu.items:
-        existing_depths = [items[item_id].metadata.dimensions.depth for item_id in vsu.items]
+    # Gather all items: existing items in VSU + pending placements
+    items_with_index = []
 
-        # Check if all existing items have same depth (same product stacking)
-        all_same_depth = len(set(existing_depths)) == 1
+    # Add existing items from VSU
+    for item_id in vsu.items:
+        item_obj = items[item_id]
+        items_with_index.append({
+            'stock_index': item_obj.stock_index,
+            'depth': item_obj.metadata.dimensions.depth
+        })
 
-        if all_same_depth and existing_depths[0] == item_depth:
-            # SAME PRODUCT: All items have same depth - use efficient uniform calculation
-            max_items = calculate_max_items_in_vsu(vsu, item_depth)
-            effective_item_depth = item_depth + DEPTH_GAP_BETWEEN_ITEMS
-            positions_from_back = max_items - 1 - stock_index
-            z_offset = positions_from_back * effective_item_depth
-            return back_wall_z - item_depth - z_offset
+    # Also include pending placements (items suggested but not yet completed)
+    pending_for_vsu = [p for p in pending_placements.values() if p["vsu_id"] == vsu.id]
+    for p in pending_for_vsu:
+        items_with_index.append({
+            'stock_index': p['stock_index'],
+            'depth': p['item_depth']
+        })
+
+    # If no existing items and no pending placements, first item goes at back wall
+    if not items_with_index:
+        return back_wall_z - item_depth
+
+    # Check depths to determine same-product vs mixed-product stacking
+    existing_depths = [info['depth'] for info in items_with_index]
+    all_same_depth = len(set(existing_depths)) == 1
+
+    if all_same_depth and existing_depths[0] == item_depth and not is_mixed_product:
+        # SAME PRODUCT: All items have same depth - use efficient uniform calculation
+        max_items = calculate_max_items_in_vsu(vsu, item_depth)
+        effective_item_depth = item_depth + DEPTH_GAP_BETWEEN_ITEMS
+        positions_from_back = max_items - 1 - stock_index
+        z_offset = positions_from_back * effective_item_depth
+        return back_wall_z - item_depth - z_offset
+    else:
+        # MIXED PRODUCT or DIFFERENT DEPTHS: Calculate position based on items behind
+        # Find the maximum stock_index to determine the back-most position
+        all_indices = [item_info['stock_index'] for item_info in items_with_index] + [stock_index]
+        max_stock_index = max(all_indices)
+
+        # Sum depths of items from the back wall up to (but not including) this item
+        # Items with higher stock_index are placed first (closer to back)
+        depth_from_back = 0
+        gaps_from_back = 0
+
+        # For MIXED PRODUCT (stock_index=0): ALL existing items will be shifted back,
+        # so ALL of them will be behind the new item after placement
+        if is_mixed_product:
+            # Count ALL existing items as behind (they will all be shifted to higher indices)
+            for item_info in items_with_index:
+                depth_from_back += item_info['depth']
+                gaps_from_back += 1
         else:
-            # MIXED PRODUCT: Items have different depths - calculate position based on
-            # items that are "in front" (lower stock_index) - we need to leave room for them
-            #
-            # For items placed from back to front:
-            # - Highest stock_index item touches back wall
-            # - Each item in front needs: previous_item_z - gap - this_item_depth
-            #
-            # Since we're calculating for a specific stock_index, we sum depths of items
-            # that will be IN FRONT of this position (lower stock_index values)
-
-            # Get depths of existing items
-            items_with_index = []
-            for item_id in vsu.items:
-                item_obj = items[item_id]
-                items_with_index.append({
-                    'stock_index': item_obj.stock_index,
-                    'depth': item_obj.metadata.dimensions.depth
-                })
-
-            # Also include pending placements
-            pending_for_vsu = [p for p in pending_placements.values() if p["vsu_id"] == vsu.id]
-            for p in pending_for_vsu:
-                items_with_index.append({
-                    'stock_index': p['stock_index'],
-                    'depth': p['item_depth']
-                })
-
-            # Find the maximum stock_index to determine the back-most position
-            all_indices = [item_info['stock_index'] for item_info in items_with_index] + [stock_index]
-            max_stock_index = max(all_indices)
-
-            # Sum depths of items from the back wall up to (but not including) this item
-            # Items with higher stock_index are placed first (closer to back)
-            depth_from_back = 0
-            gaps_from_back = 0
+            # Normal case: only count items with higher stock_index
             for item_info in items_with_index:
                 if item_info['stock_index'] > stock_index:
                     depth_from_back += item_info['depth']
                     gaps_from_back += 1
 
-            # If this is the back-most item (highest stock_index), it touches the back wall
-            if stock_index == max_stock_index:
-                return back_wall_z - item_depth
-            else:
-                # Position = back_wall - depths_of_items_behind - gaps_between_them - gap_before_this - this_item_depth
-                # gaps_from_back already counts the number of items behind, which equals the number of gaps
-                # (including the gap between this item and the item immediately behind it)
-                total_offset = depth_from_back + (gaps_from_back * DEPTH_GAP_BETWEEN_ITEMS)
-                return back_wall_z - total_offset - item_depth
-    else:
-        # Empty VSU - first item goes at back wall
-        return back_wall_z - item_depth
+        # If this is the back-most item (highest stock_index), it touches the back wall
+        if stock_index == max_stock_index:
+            return back_wall_z - item_depth
+        else:
+            # Position = back_wall - depths_of_items_behind - gaps_between_them - gap_before_this - this_item_depth
+            # gaps_from_back already counts the number of items behind, which equals the number of gaps
+            # (including the gap between this item and the item immediately behind it)
+            total_offset = depth_from_back + (gaps_from_back * DEPTH_GAP_BETWEEN_ITEMS)
+            return back_wall_z - total_offset - item_depth
 
 
 def find_vsu_for_stacking(item: Item) -> Optional[VirtualStorageUnit]:
@@ -630,12 +643,17 @@ def can_stack_with_pending(item: Item, vsu: VirtualStorageUnit, pending: dict) -
     if width_diff > WIDTH_TOLERANCE:
         return False
 
-    height_diff = abs(item.metadata.dimensions.height - pending["item_height"])
-    if height_diff > HEIGHT_TOLERANCE:
+    # Height: any height that fits in VSU is OK (no tolerance check)
+    if item.metadata.dimensions.height > vsu.dimensions.height:
         return False
 
-    # Depth must match exactly
-    if item.metadata.dimensions.depth != pending["item_depth"]:
+    # Depth: Allow new item to be 0-5mm SMALLER than pending (not larger)
+    depth_diff = item.metadata.dimensions.depth - pending["item_depth"]
+    if depth_diff > 0:
+        # New item is LARGER - reject
+        return False
+    if abs(depth_diff) > DEPTH_TOLERANCE:
+        # New item is too much smaller (>5mm) - reject
         return False
 
     # Check remaining depth (accounting for actual items AND all pending items)
@@ -862,7 +880,7 @@ def calculate_next_vsu_position(shelf: Shelf, item_width: float) -> Optional[flo
     rightmost = max(shelf_vsus, key=lambda v: v.position.x + v.dimensions.width)
     next_x = rightmost.position.x + rightmost.dimensions.width + VSU_HORIZONTAL_GAP
     
-    # CRITICAL FIX: Check if new VSU fits completely within shelf bounds
+    # Check if new VSU fits completely within shelf bounds
     # Add tolerance for floating point precision and exact-fit scenarios
     if next_x + item_width <= shelf_end + WIDTH_FIT_TOLERANCE:
         available_space = shelf_end - next_x
@@ -1461,14 +1479,23 @@ async def suggest_placement(scanner_input: ScannerInput):
                 "action_needed": "Manual placement required or warehouse optimization needed"
             })
 
+        # Detect if this is a mixed product scenario (different product in existing VSU)
+        is_mixed_product = False
+        if target_vsu.items and not is_new_vsu:
+            first_item = items[target_vsu.items[0]]
+            if first_item.metadata.product_id != item.metadata.product_id:
+                is_mixed_product = True
+                print(f"   MIXED PRODUCT: New product {item.metadata.product_id} going into VSU with {first_item.metadata.product_id}")
+
         # Calculate stock index (back-to-front placement)
-        stock_index = calculate_stock_index(target_vsu, item.metadata.dimensions.depth, is_new_vsu)
+        # For mixed products: new item gets index 0 (front), existing items will be shifted
+        stock_index = calculate_stock_index(target_vsu, item.metadata.dimensions.depth, is_new_vsu, is_mixed_product)
 
         # Calculate exact Z position for this item
-        z_position = calculate_item_z_position(target_vsu, item.metadata.dimensions.depth, stock_index)
+        z_position = calculate_item_z_position(target_vsu, item.metadata.dimensions.depth, stock_index, is_mixed_product)
 
-        # Calculate max capacity for this VSU
-        max_capacity = calculate_max_items_in_vsu(target_vsu, item.metadata.dimensions.depth)
+        # Count current items in VSU
+        current_items_count = len(target_vsu.items)
 
         # Store item temporarily (not in VSU yet)
         items[item.id] = item
@@ -1489,7 +1516,8 @@ async def suggest_placement(scanner_input: ScannerInput):
             robot_id="",
             score=calculate_placement_score(item, target_vsu),
             is_new_vsu=is_new_vsu,
-            z_position=z_position
+            z_position=z_position,
+            is_mixed_product=is_mixed_product  # Track if this is a mixed product placement
         )
         tasks[task_id] = task
 
@@ -1500,7 +1528,8 @@ async def suggest_placement(scanner_input: ScannerInput):
             "item_depth": item.metadata.dimensions.depth,
             "item_width": item.metadata.dimensions.width,
             "item_height": item.metadata.dimensions.height,
-            "product_id": item.metadata.product_id
+            "product_id": item.metadata.product_id,
+            "is_mixed_product": is_mixed_product
         }
 
         # Update progress (pending)
@@ -1515,7 +1544,7 @@ async def suggest_placement(scanner_input: ScannerInput):
                 "vsu_code": target_vsu.code,
                 "vsu_id": target_vsu.id,
                 "stock_index": stock_index,
-                "max_capacity": max_capacity,
+                "items_in_vsu": current_items_count,
                 "coordinates": {
                     "x": int(target_vsu.position.x),
                     "y": int(target_vsu.position.y),
@@ -1565,11 +1594,26 @@ async def complete_task(task_id: str):
         item = items[task.item_id]
         vsu = virtual_units[task.destination_vsu_id]
 
+        # MIXED PRODUCT: Normalize existing items' stock indices to be consecutive starting from 1
+        # New item gets index 0 (front), existing items get 1, 2, 3... based on their relative order
+        if task.is_mixed_product and vsu.items:
+            print(f"   MIXED PRODUCT SHIFT: Normalizing stock indices for existing items in VSU {vsu.code}")
+            # Sort existing items by their current stock index (lower index = closer to front)
+            existing_items_sorted = sorted(
+                [(item_id, items[item_id].stock_index) for item_id in vsu.items],
+                key=lambda x: x[1]
+            )
+            # Assign consecutive indices starting from 1 (since new item gets 0)
+            for new_index, (existing_item_id, old_index) in enumerate(existing_items_sorted, start=1):
+                existing_item = items[existing_item_id]
+                existing_item.stock_index = new_index
+                print(f"      Item {existing_item_id} ({existing_item.metadata.product_id}): StockIndex {old_index} -> {new_index}")
+
         # Add item to VSU (now actually register it)
         if item.id not in vsu.items:
             vsu.items.append(item.id)
             item.vsu_id = vsu.id
-            # stock_index was already calculated in suggest
+            # stock_index was already calculated in suggest (0 for mixed product)
 
         vsu.occupied = True
 
