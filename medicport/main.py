@@ -793,11 +793,9 @@ def find_mixed_product_vsu(item: Item) -> Optional[VirtualStorageUnit]:
             print(f"      VSU {vsu.code}: Height {item_height}mm > VSU height {vsu.dimensions.height}mm")
             continue
 
-        # CRITICAL: New item width must be <= frontmost item width
-        # Can't place wider box in front of narrower one (would block it)
-        frontmost_item = items[vsu.items[-1]]  # Last item in list is frontmost
-        if item_width > frontmost_item.metadata.dimensions.width:
-            print(f"      VSU {vsu.code}: Width {item_width}mm > frontmost item {frontmost_item.metadata.dimensions.width}mm")
+        # Check if item fits within VSU width
+        if item_width > vsu.dimensions.width:
+            print(f"      VSU {vsu.code}: Width {item_width}mm > VSU width {vsu.dimensions.width}mm")
             continue
 
         # Check remaining depth (including 3mm gap for new item)
@@ -817,7 +815,7 @@ def find_mixed_product_vsu(item: Item) -> Optional[VirtualStorageUnit]:
             continue
 
         # Calculate wasted space (lower = tighter fit = better)
-        width_waste = frontmost_item.metadata.dimensions.width - item_width
+        width_waste = vsu.dimensions.width - item_width
         height_waste = vsu.dimensions.height - item_height
         depth_waste = remaining_depth - item_depth
         total_waste = width_waste + height_waste + depth_waste
@@ -835,7 +833,7 @@ def find_mixed_product_vsu(item: Item) -> Optional[VirtualStorageUnit]:
             'existing_product_id': existing_product_id,
             'shelf_name': shelf.name,
             'items_count': len(vsu.items),
-            'frontmost_width': frontmost_item.metadata.dimensions.width
+            'vsu_width': vsu.dimensions.width
         })
 
         print(f"      VSU {vsu.code} ({shelf.name}): CAN FIT in front")
@@ -3070,144 +3068,8 @@ from relocation import (
     get_relocation_stats
 )
 
-class TemporaryRelocateRequest(BaseModel):
-    """Request to relocate item to temporary storage - ONLY accepts task_id from dispense instruction"""
-    task_id: str = Field(..., description="Task ID from dispense instruction (e.g., RELOCATE-001) - REQUIRED")
-
-class TemporaryRestockRequest(BaseModel):
-    """Request to restock items from temporary storage"""
-    item_ids: Optional[List[int]] = None  # If None, restock all items
-
-@app.post("/api/temporary/relocate", tags=["Temporary Storage"])
-async def relocate_to_temporary_storage(request: TemporaryRelocateRequest):
-    """
-    Relocate an obstructing box to temporary storage using task_id
-
-    This endpoint is called by the robot during dispense execution
-    when it needs to move a blocking box out of the way.
-
-    Process:
-    1. Lookup task_id from dispense instruction (contains item details)
-    2. Find available temp VSU on same shelf
-    3. Move item to temp VSU (coordinates returned)
-    4. Remove item from main inventory (ml_robot_updated.json)
-    5. Add item to temporary storage (temporary_storage.json)
-
-    Request body:
-    {
-        "task_id": "RELOCATE-001"
-    }
-
-    Response:
-    {
-        "status": "success",
-        "task_id": "RELOCATE-001",
-        "item_id": 123,
-        "barcode": "TEST_BOX_123",
-        "product_id": 20,
-        "original_vsu_code": "vu15",
-        "temp_vsu_id": 101,
-        "temp_vsu_code": "temp_rack1_1_1",
-        "temp_coordinates": {
-            "x": 550.0,
-            "y": 825.0,
-            "z": 40.0
-        },
-        "relocated_at": "2025-12-06T10:30:00"
-    }
-    """
-    try:
-        global relocate_tasks_store
-
-        print(f"\n{'='*60}")
-        print(f"TEMPORARY RELOCATION REQUEST")
-        print(f"{'='*60}")
-        print(f"Task ID: {request.task_id}")
-
-        # Lookup task details from relocate_tasks_store
-        if request.task_id not in relocate_tasks_store:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Task ID {request.task_id} not found. Make sure to call /dispense/task first to get valid task IDs."
-            )
-
-        task_info = relocate_tasks_store[request.task_id]
-        item_id = task_info["item_id"]
-
-        print(f"Item ID: {item_id}")
-        print(f"Barcode: {task_info['barcode']}")
-        print(f"Product ID: {task_info['product_id']}")
-
-        # Get item from warehouse
-        if item_id not in items:
-            raise HTTPException(status_code=404, detail=f"Item {item_id} not found in warehouse")
-
-        item = items[item_id]
-        barcode = item.metadata.barcode
-        product_id = item.metadata.product_id
-        original_vsu_id = item.vsu_id
-        original_vsu_code = virtual_units[original_vsu_id].code if original_vsu_id and original_vsu_id in virtual_units else None
-
-        # Relocate item (updates VSU in main inventory directly)
-        # Pass VSU creation parameters so relocation can create new VSUs like stock-in
-        global vsu_counter
-        relocation_info = relocate_item(
-            item_id=item_id,
-            items=items,
-            virtual_units=virtual_units,
-            shelves=shelves,
-            reason="obstruction_removal",
-            vsu_counter=vsu_counter,
-            VirtualStorageUnit=VirtualStorageUnit,
-            Dimensions=Dimensions,
-            Position=Position
-        )
-
-        # Update vsu_counter if a new VSU was created
-        if relocation_info.get("is_new_vsu") and relocation_info.get("vsu_counter"):
-            vsu_counter = relocation_info["vsu_counter"]
-            print(f"[RELOCATE] Updated vsu_counter to {vsu_counter}")
-
-        # Save updated warehouse state (item VSU was updated in-place)
-        save_warehouse_state()
-
-        # Update task status in store
-        relocate_tasks_store[request.task_id].update({
-            "original_vsu_id": relocation_info.get("original_vsu_id"),
-            "original_vsu_code": relocation_info.get("original_vsu_code"),
-            "new_vsu_id": relocation_info.get("new_vsu_id"),
-            "new_vsu_code": relocation_info.get("new_vsu_code"),
-            "status": "completed",
-            "relocated_at": relocation_info.get("relocated_at")
-        })
-
-        print(f"Item {item_id} relocated (VSU updated in main inventory)")
-        print(f"  From: {relocation_info.get('original_vsu_code')}")
-        print(f"  To: {relocation_info.get('new_vsu_code')}")
-        print(f"{'='*60}\n")
-
-        return {
-            "status": "success",
-            "task_id": request.task_id,
-            "item_id": item_id,
-            "barcode": barcode,
-            "product_id": product_id,
-            "original_vsu_code": original_vsu_code,
-            **relocation_info
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error relocating to temporary storage: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to relocate item: {str(e)}"
-        )
-
 # Dictionary to store relocate tasks (task_id -> task_data)
+# Used by dispense_server.py for tracking relocation tasks
 relocate_tasks_store = {}
 
 @app.get("/api/relocation/history", tags=["Relocation"])
