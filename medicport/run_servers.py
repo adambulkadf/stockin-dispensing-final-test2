@@ -73,7 +73,7 @@ async def main():
     print("\nServers stopped.")
 
 
-if name == "__main__":
+if __name__ == "__main__":
     kill_existing_processes()
     try:
         asyncio.run(main())
