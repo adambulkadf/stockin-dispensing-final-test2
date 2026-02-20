@@ -25,8 +25,8 @@ from main import (
     Position,
 )
 
-# Import relocation function
-from relocation import relocate_item
+# Import relocation functions
+from relocation import relocate_item, get_relocation_history, get_relocation_stats
 
 # Import dispense request/response models and endpoint functions
 from dispensing import (
@@ -466,4 +466,57 @@ async def complete_relocation(request: CompleteRelocateRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to complete relocation: {str(e)}"
+        )
+
+
+@dispense_app.get("/api/relocation/history", tags=["Relocation"])
+async def get_relocation_history_endpoint():
+    """
+    Get relocation history (audit trail)
+
+    Response:
+    {
+        "status": "success",
+        "total_relocations": 5,
+        "relocations": [...]
+    }
+    """
+    try:
+        history = get_relocation_history()
+        return {
+            "status": "success",
+            "total_relocations": len(history),
+            "relocations": history
+        }
+    except Exception as e:
+        print(f"Error getting relocation history: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get relocation history: {str(e)}"
+        )
+
+
+@dispense_app.get("/api/relocation/stats", tags=["Relocation"])
+async def get_relocation_stats_endpoint():
+    """
+    Get relocation statistics
+
+    Response:
+    {
+        "status": "success",
+        "total_relocations": 5,
+        "last_updated": "2025-12-04T10:30:00"
+    }
+    """
+    try:
+        stats = get_relocation_stats()
+        return {
+            "status": "success",
+            **stats
+        }
+    except Exception as e:
+        print(f"Error getting relocation stats: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get relocation stats: {str(e)}"
         )
