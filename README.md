@@ -6,7 +6,8 @@ Backend systém pro automatizovaný farmaceutický sklad MedicPort. Řídí robo
 
 Systém běží jako dvě FastAPI aplikace ve sdílené paměti:
 - **Port 8000** — Zaskladnění (stock-in), správa skladu, inventář, monitoring
-- **Port 8001** — Výdej (dispensing) s multi-pick batchingem a výstupním queueingem
+- **Port 8001** — Výdej (dispensing) s multi-pick batchingem a výstupním queueingem, relocate
+  
 
 ## Struktura projektu
 
