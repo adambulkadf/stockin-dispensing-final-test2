@@ -1665,6 +1665,31 @@ def complete_dispense_endpoint(
             if normalized_count > 0:
                 print(f"  Normalized {normalized_count} stock indices in VSU {vsu.code}")
 
+        # Remove empty VSUs from inventory
+        vsus_removed = []
+        for vsu_id in affected_vsus:
+            if vsu_id not in virtual_units:
+                continue
+            vsu = virtual_units[vsu_id]
+            if not vsu.items:  # VSU is empty
+                vsu_code = vsu.code
+                shelf_id = vsu.shelf_id
+
+                # Remove from shelf's virtual_units list
+                if shelf_id and shelf_id in shelves:
+                    shelf = shelves[shelf_id]
+                    if vsu_id in shelf.virtual_units:
+                        shelf.virtual_units.remove(vsu_id)
+                        print(f"  Removed VSU {vsu_code} from shelf {shelf.name}")
+
+                # Remove from virtual_units dict
+                del virtual_units[vsu_id]
+                vsus_removed.append({"vsu_id": vsu_id, "vsu_code": vsu_code, "shelf_id": shelf_id})
+                print(f"  Deleted empty VSU {vsu_code} (ID: {vsu_id})")
+
+        if vsus_removed:
+            print(f"Total empty VSUs removed: {len(vsus_removed)}")
+
         for product_id, quantity in product_quantities.items():
             barcode = product_barcodes[product_id]
             update_dispense_log(product_id, barcode, quantity)
@@ -1781,6 +1806,7 @@ def complete_dispense_endpoint(
                 }
                 for pid, qty in product_quantities.items()
             ],
+            "vsus_removed": vsus_removed,
             "robots_freed": list(set(robots_freed)),
             "completed_at": task.completed_at.isoformat()
         }
@@ -1936,6 +1962,26 @@ def fail_dispense_endpoint(
                 if normalized_count > 0:
                     print(f"  Normalized {normalized_count} stock indices in VSU {vsu.code}")
 
+            # Remove empty VSUs from inventory (partial fail)
+            vsus_removed = []
+            for vsu_id in affected_vsus:
+                if vsu_id not in virtual_units:
+                    continue
+                vsu = virtual_units[vsu_id]
+                if not vsu.items:
+                    vsu_code = vsu.code
+                    shelf_id = vsu.shelf_id
+                    if shelf_id and shelf_id in shelves:
+                        shelf = shelves[shelf_id]
+                        if vsu_id in shelf.virtual_units:
+                            shelf.virtual_units.remove(vsu_id)
+                    del virtual_units[vsu_id]
+                    vsus_removed.append({"vsu_id": vsu_id, "vsu_code": vsu_code, "shelf_id": shelf_id})
+                    print(f"  Deleted empty VSU {vsu_code} (ID: {vsu_id})")
+
+            if vsus_removed:
+                print(f"Total empty VSUs removed: {len(vsus_removed)}")
+
             if save_warehouse_func:
                 save_warehouse_func()
 
@@ -2039,7 +2085,8 @@ def fail_dispense_endpoint(
             "items_kept": items_kept,
             "robots_freed": list(set(robots_freed)),
             "failure_reason": request.reason,
-            "failed_at": task.completed_at.isoformat()
+            "failed_at": task.completed_at.isoformat(),
+            "vsus_removed": vsus_removed if successful_trips else []
         }
 
     except HTTPException:
