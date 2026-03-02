@@ -387,8 +387,24 @@ async def complete_relocation(request: CompleteRelocateRequest):
 
         if item_id in original_vsu.items:
             original_vsu.items.remove(item_id)
+
+        # Check if source VSU is now empty and should be deleted
+        vsu_removed = None
         if not original_vsu.items:
             original_vsu.occupied = False
+            # Delete empty VSU from inventory
+            shelf_id = original_vsu.shelf_id
+            if shelf_id and shelf_id in shelves:
+                shelf = shelves[shelf_id]
+                if original_vsu_id in shelf.virtual_units:
+                    shelf.virtual_units.remove(original_vsu_id)
+            del virtual_units[original_vsu_id]
+            vsu_removed = {
+                "vsu_id": original_vsu_id,
+                "vsu_code": original_vsu_code,
+                "shelf_id": shelf_id
+            }
+            print(f"[RELOCATE] Deleted empty VSU {original_vsu_code} (ID: {original_vsu_id})")
 
         has_existing_items = new_vsu.items and len(new_vsu.items) > 0
 
@@ -429,7 +445,7 @@ async def complete_relocation(request: CompleteRelocateRequest):
         print(f"  To: {new_vsu_code} (stock_index={new_stock_index})")
         print(f"{'='*60}\n")
 
-        return {
+        response = {
             "status": "success",
             "task_id": request.task_id,
             "item_id": item_id,
@@ -438,9 +454,7 @@ async def complete_relocation(request: CompleteRelocateRequest):
             "from": {
                 "vsu_id": original_vsu_id,
                 "vsu_code": original_vsu_code,
-                "stock_index": old_stock_index,
-                "x": original_vsu.position.x,
-                "y": original_vsu.position.y
+                "stock_index": old_stock_index
             },
             "to": {
                 "vsu_id": new_vsu_id,
@@ -454,8 +468,10 @@ async def complete_relocation(request: CompleteRelocateRequest):
             "is_new_vsu": task_info.get("is_new_vsu", False),
             "committed": True,
             "relocated_at": completed_at.isoformat(),
-            "reason": "obstruction_removal"
+            "reason": "obstruction_removal",
+            "vsu_removed": vsu_removed
         }
+        return response
 
     except HTTPException:
         raise
