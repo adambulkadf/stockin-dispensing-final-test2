@@ -661,8 +661,18 @@ def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_
     For MIXED product stacking (items may have different depths):
     - Sums actual depths of items behind (higher stock_index)
     - Ensures no collision between boxes of different depths
+
+    Handles both positive Z (right-hand shelves) and negative Z (left-hand shelves):
+    - Positive Z: back wall at z + depth, items placed towards lower Z
+    - Negative Z: back wall at z - depth, items placed towards higher Z (towards 0)
     """
-    back_wall_z = vsu.position.z + vsu.dimensions.depth
+    # Determine if this is a negative Z (left-hand) shelf
+    is_negative_z = vsu.position.z < 0
+
+    if is_negative_z:
+        back_wall_z = vsu.position.z - vsu.dimensions.depth
+    else:
+        back_wall_z = vsu.position.z + vsu.dimensions.depth
 
     # Gather all items: existing items in VSU + pending placements
     items_with_index = []
@@ -685,7 +695,10 @@ def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_
 
     # If no existing items and no pending placements, first item goes at back wall
     if not items_with_index:
-        return back_wall_z - item_depth
+        if is_negative_z:
+            return back_wall_z + item_depth
+        else:
+            return back_wall_z - item_depth
 
     # Check depths to determine same-product vs mixed-product stacking
     existing_depths = [info['depth'] for info in items_with_index]
@@ -697,7 +710,9 @@ def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_
         effective_item_depth = item_depth + DEPTH_GAP_BETWEEN_ITEMS
         positions_from_back = max_items - 1 - stock_index
         z_offset = positions_from_back * effective_item_depth
-        return back_wall_z - item_depth - z_offset
+        if is_negative_z:
+            return back_wall_z + item_depth + z_offset        else:
+            return back_wall_z - item_depth - z_offset
     else:
         # MIXED PRODUCT or DIFFERENT DEPTHS: Calculate position based on items behind
         # Find the maximum stock_index to determine the back-most position
@@ -725,13 +740,17 @@ def calculate_item_z_position(vsu: VirtualStorageUnit, item_depth: float, stock_
 
         # If this is the back-most item (highest stock_index), it touches the back wall
         if stock_index == max_stock_index:
-            return back_wall_z - item_depth
+            if is_negative_z:
+                return back_wall_z + item_depth            else:
+                return back_wall_z - item_depth
         else:
             # Position = back_wall - depths_of_items_behind - gaps_between_them - gap_before_this - this_item_depth
             # gaps_from_back already counts the number of items behind, which equals the number of gaps
             # (including the gap between this item and the item immediately behind it)
             total_offset = depth_from_back + (gaps_from_back * DEPTH_GAP_BETWEEN_ITEMS)
-            return back_wall_z - total_offset - item_depth
+            if is_negative_z:
+                return back_wall_z + total_offset + item_depth            else:
+                return back_wall_z - total_offset - item_depth
 
 
 def find_vsu_for_stacking(item: Item) -> tuple[Optional[VirtualStorageUnit], list]:
